@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Eye & Motion Control</title>
+<style>
+  :root { --bg:#0e1117; --fg:#e6edf3; --accent:#3fb6ff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.4 Arial, sans-serif;
+         display:flex; flex-direction:column; align-items:center; gap:12px; padding:12px; }
+  #game { width:min(100%,960px); aspect-ratio:16/9; background:#05070a; border:1px solid #2a3140; border-radius:8px; }
+  #ui { display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:center; }
+  select, button { background:#1b2230; color:var(--fg); border:1px solid #333c4d; border-radius:6px; padding:8px 12px; font:inherit; cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  #cam { position:fixed; right:12px; bottom:12px; width:160px; border-radius:6px; transform:scaleX(-1); opacity:.8; border:1px solid #2a3140; }
+  #status { color:#9aa7b8; }
+  small { color:#9aa7b8; max-width:760px; text-align:center; }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+<div id="ui">
+  <select id="mode">
+    <option value="head">Head (nose) + open mouth to fire</option>
+    <option value="gaze">Eyes (gaze) + long blink to fire</option>
+    <option value="hand">Hand (index) + pinch to fire</option>
+  </select>
+  <button id="start">Start camera</button>
+  <button id="calib">Calibrate center</button>
+  <label>Smoothing <input id="smooth" type="range" min="0.05" max="1" step="0.05" value="0.3"></label>
+  <span id="status">Ready</span>
+</div>
+<small>Look straight at the screen and click Calibrate center. Pop the targets with the crosshair. The game pauses when your face or hand is lost. Needs good front lighting.</small>
+<video id="cam" playsinline muted></video>
+
+<script type="module">
+import { FilesetResolver, FaceLandmarker, HandLandmarker }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm";
+
+const WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const FACE_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+const HAND_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+
+const $ = id => document.getElementById(id);
+const W = 960, H = 540, ctx = $("game").getContext("2d"), cam = $("cam");
+const clamp = (v, a = 0, b = 1) => Math.min(b, Math.max(a, v));
+
+// ---- Input state: the ONLY thing the game reads (swap in any control scheme) ----
+const S = { x: 0.5, y: 0.5, fire: false, seen: false };
+const raw = { hx: 0.5, hy: 0.5, gx: 0, gy: 0 };
+let cal = { hx: 0.5, hy: 0.5, gx: 0, gy: 0 };
+const trig = { on: false, since: 0 };       // fire trigger with hysteresis
+let face = null, hand = null, running = false, lastVideoTime = -1;
+
+async function start() {
+  try {
+    $("status").textContent = "Loading models...";
+    const fs = await FilesetResolver.forVisionTasks(WASM);
+    face = await FaceLandmarker.createFromOptions(fs, {
+      baseOptions: { modelAssetPath: FACE_URL }, runningMode: "VIDEO",
+      numFaces: 1, outputFaceBlendshapes: true });
+    hand = await HandLandmarker.createFromOptions(fs, {
+      baseOptions: { modelAssetPath: HAND_URL }, runningMode: "VIDEO", numHands: 1 });
+    cam.srcObject = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+    await cam.play();
+    running = true;
+    $("status").textContent = "Tracking";
+  } catch (e) {
+    $("status").textContent = "Error: " + e.message + " (camera needs HTTPS or localhost)";
+  }
+}
+
+function setTrigger(value, onAt, offAt, holdMs = 0) {
+  const now = performance.now();
+  if (!trig.on) {
+    if (value > onAt) { if (!trig.since) trig.since = now; if (now - trig.since >= holdMs) trig.on = true; }
+    else trig.since = 0;
+    return trig.on;        // true only on the frame it turns on
+  }
+  if (value < offAt) { trig.on = false; trig.since = 0; }
+  return false;
+}
+
+function track(t) {
+  const mode = $("mode").value, k = +$("smooth").value;
+  let tx = S.x, ty = S.y, fired = false, seen = false;
+
+  if (mode === "hand") {
+    const l = hand.detectForVideo(cam, t).landmarks[0];
+    if (l) {
+      seen = true;
+      tx = clamp((1 - l[8].x - 0.2) / 0.6);            // active zone: middle 60% of frame
+      ty = clamp((l[8].y - 0.2) / 0.6);
+      const size = Math.hypot(l[0].x - l[9].x, l[0].y - l[9].y) + 1e-6;
+      const d = Math.hypot(l[4].x - l[8].x, l[4].y - l[8].y) / size;
+      fired = setTrigger(1 - d, 0.75, 0.6);              // pinch: d < 0.25 on, > 0.40 off
+    }
+  } else {
+    const r = face.detectForVideo(cam, t);
+    const l = r.faceLandmarks[0];
+    if (l) {
+      seen = true;
+      const b = {};
+      for (const c of r.faceBlendshapes[0].categories) b[c.categoryName] = c.score;
+      if (mode === "head") {
+        raw.hx = 1 - l[1].x; raw.hy = l[1].y;            // nose tip, mirrored
+        tx = clamp(0.5 + (raw.hx - cal.hx) * 5);
+        ty = clamp(0.5 + (raw.hy - cal.hy) * 6);
+        fired = setTrigger(b.jawOpen, 0.5, 0.25);
+      } else {
+        raw.gx = ((b.eyeLookInLeft + b.eyeLookOutRight) - (b.eyeLookOutLeft + b.eyeLookInRight)) / 2;
+        raw.gy = ((b.eyeLookDownLeft + b.eyeLookDownRight) - (b.eyeLookUpLeft + b.eyeLookUpRight)) / 2;
+        tx = clamp(0.5 + (raw.gx - cal.gx) * 2.2);
+        ty = clamp(0.5 + (raw.gy - cal.gy) * 2.2);
+        const blink = Math.min(b.eyeBlinkLeft, b.eyeBlinkRight);
+        fired = setTrigger(blink, 0.6, 0.3, 300);        // deliberate ~0.3 s blink only
+      }
+    }
+  }
+  S.seen = seen;
+  if (seen) { S.x += k * (tx - S.x); S.y += k * (ty - S.y); }
+  if (fired) S.fire = true;
+}
+
+// ---------------- Demo game: pop the targets ----------------
+const G = { score: 0, targets: [], last: 0, flash: 0 };
+function updateGame(dt) {
+  if (!running || !S.seen) return;
+  G.last += dt;
+  if (G.last > 0.9) {
+    G.last = 0;
+    G.targets.push({ x: 60 + Math.random() * (W - 120), y: 60 + Math.random() * (H - 120), life: 2.5, r: 34 });
+  }
+  const cx = S.x * W, cy = S.y * H;
+  if (S.fire) {
+    G.flash = 0.12;
+    const i = G.targets.findIndex(t => Math.hypot(t.x - cx, t.y - cy) < t.r + 12);
+    if (i >= 0) { G.targets.splice(i, 1); G.score++; }
+  }
+  S.fire = false;
+  G.targets.forEach(t => t.life -= dt);
+  G.targets = G.targets.filter(t => t.life > 0);
+  G.flash = Math.max(0, G.flash - dt);
+}
+
+function draw() {
+  ctx.fillStyle = "#05070a"; ctx.fillRect(0, 0, W, H);
+  for (const t of G.targets) {
+    ctx.beginPath(); ctx.arc(t.x, t.y, t.r, 0, 7); ctx.fillStyle = "#1f8a4c"; ctx.fill();
+    ctx.beginPath(); ctx.arc(t.x, t.y, t.r + 6, -Math.PI / 2, -Math.PI / 2 + (t.life / 2.5) * Math.PI * 2);
+    ctx.strokeStyle = "#7dffb0"; ctx.lineWidth = 3; ctx.stroke();
+  }
+  const cx = S.x * W, cy = S.y * H;
+  ctx.strokeStyle = G.flash > 0 ? "#ff5a5a" : "#3fb6ff"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(cx, cy, 18, 0, 7); ctx.moveTo(cx - 28, cy); ctx.lineTo(cx + 28, cy);
+  ctx.moveTo(cx, cy - 28); ctx.lineTo(cx, cy + 28); ctx.stroke();
+  ctx.fillStyle = "#e6edf3"; ctx.font = "bold 24px Arial"; ctx.fillText("Score: " + G.score, 20, 38);
+  if (!running || !S.seen) {
+    ctx.textAlign = "center"; ctx.font = "bold 30px Arial";
+    ctx.fillText(running ? "PAUSED - face/hand lost" : "Click Start camera", W / 2, H / 2);
+    ctx.textAlign = "left";
+  }
+}
+
+let prev = performance.now();
+function loop() {
+  const now = performance.now(), dt = Math.min((now - prev) / 1000, 0.05); prev = now;
+  if (running && cam.currentTime !== lastVideoTime) { lastVideoTime = cam.currentTime; track(now); }
+  updateGame(dt); draw();
+  requestAnimationFrame(loop);
+}
+
+$("start").onclick = start;
+$("calib").onclick = () => { cal = { ...raw }; $("status").textContent = "Calibrated"; };
+$("mode").onchange = () => { trig.on = false; trig.since = 0; $("status").textContent = "Mode changed: recalibrate"; };
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
