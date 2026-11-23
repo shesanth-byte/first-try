@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Eye Tracking Control</title>
+<style>
+  :root { --bg:#0e1117; --fg:#e6edf3; --accent:#3fb6ff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.4 Arial, sans-serif;
+         display:flex; flex-direction:column; align-items:center; gap:12px; padding:12px; }
+  #game { width:min(100%,960px); aspect-ratio:16/9; background:#05070a; border:1px solid #2a3140; border-radius:8px; }
+  #game:fullscreen { width:100vw; height:100vh; aspect-ratio:auto; border:0; border-radius:0; }
+  #ui { display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:center; }
+  button { background:#1b2230; color:var(--fg); border:1px solid #333c4d; border-radius:6px; padding:8px 12px; font:inherit; cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  #cam { position:fixed; right:12px; bottom:12px; width:160px; border-radius:6px; transform:scaleX(-1); opacity:.8; border:1px solid #2a3140; }
+  #status { color:#9aa7b8; }
+  small { color:#9aa7b8; max-width:760px; text-align:center; }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+<div id="ui">
+  <button id="start">1. Start camera</button>
+  <button id="calib">2. Calibrate (9 dots)</button>
+  <button id="full">Fullscreen</button>
+  <label>Smoothing <input id="smooth" type="range" min="0.05" max="1" step="0.05" value="0.25"></label>
+  <label><input id="dwell" type="checkbox" checked> Dwell to select</label>
+  <span id="status">Ready</span>
+</div>
+<small>Sit about an arm's length from the screen with good front lighting and keep your head fairly still.
+Go fullscreen, then calibrate: look at each dot until it moves. Pop targets by staring at them (dwell) or by a deliberate half-second blink.
+Recalibrate whenever you move or change seats.</small>
+<video id="cam" playsinline muted></video>
+
+<script type="module">
+import { FilesetResolver, FaceLandmarker }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm";
+
+const WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const FACE_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+
+const $ = id => document.getElementById(id);
+const W = 960, H = 540, canvas = $("game"), ctx = canvas.getContext("2d"), cam = $("cam");
+const clamp = (v, a = 0, b = 1) => Math.min(b, Math.max(a, v));
+
+// ---- Shared input state (the game reads only this) ----
+const S = { x: 0.5, y: 0.5, fire: false, seen: false };
+let face = null, running = false, lastVideoTime = -1;
+let F = null;                       // latest eye features
+let model = null;                   // fitted gaze -> screen mapping
+const trig = { on: false, since: 0 };
+
+// ---------------- Eye features from iris landmarks ----------------
+function features(l) {
+  const ratio = (p, a, b) => (p - a) / ((b - a) || 1e-6);
+  const hR = ratio(l[468].x, l[33].x, l[133].x);     // right eye: outer -> inner corner
+  const hL = ratio(l[473].x, l[362].x, l[263].x);    // left eye: inner -> outer corner
+  const vR = ratio(l[468].y, l[159].y, l[145].y);    // upper -> lower eyelid
+  const vL = ratio(l[473].y, l[386].y, l[374].y);
+  // nose position added so small head movements are compensated by the fit
+  return [1, (hR + hL) / 2, (vR + vL) / 2, l[1].x, l[1].y];
+}
+
+// ---------------- Tiny linear regression (least squares) ----------------
+function solve(A, b) {
+  const n = b.length, M = A.map((r, i) => [...r, b[i]]);
+  for (let i = 0; i < n; i++) {
+    let p = i;
+    for (let r = i + 1; r < n; r++) if (Math.abs(M[r][i]) > Math.abs(M[p][i])) p = r;
+    [M[i], M[p]] = [M[p], M[i]];
+    const d = M[i][i] || 1e-9;
+    for (let c = i; c <= n; c++) M[i][c] /= d;
+    for (let r = 0; r < n; r++) if (r !== i) {
+      const f = M[r][i];
+      for (let c = i; c <= n; c++) M[r][c] -= f * M[i][c];
+    }
+  }
+  return M.map(r => r[n]);
+}
+function fit(data) {                 // data: [{f:[...], x, y}]
+  const n = data[0].f.length, A = Array.from({ length: n }, () => Array(n).fill(0));
+  const bx = Array(n).fill(0), by = Array(n).fill(0);
+  for (const d of data) for (let i = 0; i < n; i++) {
+    bx[i] += d.f[i] * d.x; by[i] += d.f[i] * d.y;
+    for (let j = 0; j < n; j++) A[i][j] += d.f[i] * d.f[j];
+  }
+  for (let i = 1; i < n; i++) A[i][i] += 1e-4;     // small ridge for stability
+  const wx = solve(A, bx), wy = solve(A, by);
+  const pred = f => [clamp(wx.reduce((s, w, i) => s + w * f[i], 0)),
+                     clamp(wy.reduce((s, w, i) => s + w * f[i], 0))];
+  const err = data.reduce((s, d) => { const p = pred(d.f); return s + Math.hypot(p[0] - d.x, p[1] - d.y); }, 0) / data.length;
+  return { pred, err };
+}
+
+// ---------------- Calibration (3x3 grid) ----------------
+const GRID = [0.1, 0.5, 0.9];
+const POINTS = GRID.flatMap(y => GRID.map(x => ({ x, y })));
+const C = { active: false, i: 0, t0: 0, samples: [], data: [] };
+const WAIT = 900, COLLECT = 800;
+
+function startCalibration() {
+  if (!running) { $("status").textContent = "Start the camera first"; return; }
+  Object.assign(C, { active: true, i: 0, t0: performance.now(), samples: [], data: [] });
+  model = null;
+}
+function updateCalibration(now) {
+  const e = now - C.t0;
+  if (e > WAIT && e < WAIT + COLLECT && F) C.samples.push(F);
+  if (e >= WAIT + COLLECT) {
+    if (C.samples.length >= 5) {
+      const avg = C.samples[0].map((_, k) => C.samples.reduce((s, f) => s + f[k], 0) / C.samples.length);
+      C.data.push({ f: avg, x: POINTS[C.i].x, y: POINTS[C.i].y });
+    }
+    C.samples = []; C.i++; C.t0 = now;
+    if (C.i >= POINTS.length) {
+      C.active = false;
+      if (C.data.length >= 6) {
+        const r = fit(C.data); model = r.pred;
+        $("status").textContent = "Calibrated (avg error " + (r.err * 100).toFixed(1) + "% of screen)";
+      } else $("status").textContent = "Calibration failed: face not seen enough. Try again.";
+    }
+  }
+}
+
+// ---------------- Tracking ----------------
+function setTrigger(value, onAt, offAt, holdMs) {
+  const now = performance.now();
+  if (!trig.on) {
+    if (value > onAt) { if (!trig.since) trig.since = now; if (now - trig.since >= holdMs) trig.on = true; }
+    else trig.since = 0;
+    return trig.on;
+  }
+  if (value < offAt) { trig.on = false; trig.since = 0; }
+  return false;
+}
+function track(t) {
+  const r = face.detectForVideo(cam, t), l = r.faceLandmarks[0];
+  S.seen = !!l;
+  if (!l) { F = null; return; }
+  const b = {};
+  for (const c of r.faceBlendshapes[0].categories) b[c.categoryName] = c.score;
+  const blink = Math.min(b.eyeBlinkLeft, b.eyeBlinkRight);
+  if (blink < 0.35) {                       // ignore frames while the eyes are closing
+    F = features(l);
+    if (model) {
+      const k = +$("smooth").value, p = model(F);
+      S.x += k * (p[0] - S.x); S.y += k * (p[1] - S.y);
+    }
+  }
+  if (setTrigger(blink, 0.6, 0.3, 300)) S.fire = true;   // deliberate ~0.3 s blink
+}
+
+// ---------------- Demo game: pop the targets ----------------
+const G = { score: 0, targets: [], last: 0, flash: 0 };
+function popAt(i) { G.targets.splice(i, 1); G.score++; }
+function updateGame(dt) {
+  if (!running || !S.seen || !model || C.active) return;
+  G.last += dt;
+  if (G.last > 1.1) {
+    G.last = 0;
+    G.targets.push({ x: 80 + Math.random() * (W - 160), y: 80 + Math.random() * (H - 160), life: 4, r: 44, dwell: 0 });
+  }
+  const gx = S.x * W, gy = S.y * H, useDwell = $("dwell").checked;
+  for (const t of G.targets) {
+    const on = Math.hypot(t.x - gx, t.y - gy) < t.r + 20;
+    t.dwell = on ? t.dwell + dt : Math.max(0, t.dwell - dt * 2);
+    t.life -= dt;
+  }
+  if (useDwell) { const i = G.targets.findIndex(t => t.dwell > 0.9); if (i >= 0) popAt(i); }
+  if (S.fire) {
+    G.flash = 0.12;
+    const i = G.targets.findIndex(t => Math.hypot(t.x - gx, t.y - gy) < t.r + 20);
+    if (i >= 0) popAt(i);
+  }
+  S.fire = false;
+  G.targets = G.targets.filter(t => t.life > 0);
+  G.flash = Math.max(0, G.flash - dt);
+}
+
+function centerText(s, y, size = 28) {
+  ctx.textAlign = "center"; ctx.font = "bold " + size + "px Arial"; ctx.fillStyle = "#e6edf3";
+  ctx.fillText(s, W / 2, y); ctx.textAlign = "left";
+}
+function draw(now) {
+  ctx.fillStyle = "#05070a"; ctx.fillRect(0, 0, W, H);
+  if (C.active) {
+    const p = POINTS[C.i], px = p.x * W, py = p.y * H, e = now - C.t0;
+    const pulse = 10 + 4 * Math.sin(now / 120);
+    ctx.beginPath(); ctx.arc(px, py, pulse + 8, 0, 7); ctx.strokeStyle = "#3fb6ff"; ctx.lineWidth = 2; ctx.stroke();
+    ctx.beginPath(); ctx.arc(px, py, e > WAIT ? 6 : pulse, 0, 7); ctx.fillStyle = e > WAIT ? "#ff5a5a" : "#3fb6ff"; ctx.fill();
+    centerText("Look at the dot  (" + (C.i + 1) + "/" + POINTS.length + ")", H / 2 - 20, 24);
+    return;
+  }
+  for (const t of G.targets) {
+    ctx.beginPath(); ctx.arc(t.x, t.y, t.r, 0, 7); ctx.fillStyle = "#1f8a4c"; ctx.fill();
+    ctx.beginPath(); ctx.arc(t.x, t.y, t.r + 7, -Math.PI / 2, -Math.PI / 2 + Math.min(1, t.dwell / 0.9) * Math.PI * 2);
+    ctx.strokeStyle = "#7dffb0"; ctx.lineWidth = 4; ctx.stroke();
+  }
+  if (model && S.seen) {
+    const gx = S.x * W, gy = S.y * H;
+    ctx.beginPath(); ctx.arc(gx, gy, 14, 0, 7);
+    ctx.strokeStyle = G.flash > 0 ? "#ff5a5a" : "#3fb6ff"; ctx.lineWidth = 2; ctx.stroke();
+    ctx.beginPath(); ctx.arc(gx, gy, 3, 0, 7); ctx.fillStyle = ctx.strokeStyle; ctx.fill();
+  }
+  ctx.fillStyle = "#e6edf3"; ctx.font = "bold 24px Arial"; ctx.fillText("Score: " + G.score, 20, 38);
+  if (!running) centerText("Click 1. Start camera", H / 2);
+  else if (!model) centerText("Click 2. Calibrate (go fullscreen first for best results)", H / 2, 24);
+  else if (!S.seen) centerText("PAUSED - face lost", H / 2);
+}
+
+let prev = performance.now();
+function loop() {
+  const now = performance.now(), dt = Math.min((now - prev) / 1000, 0.05); prev = now;
+  if (running && cam.currentTime !== lastVideoTime) { lastVideoTime = cam.currentTime; track(now); }
+  if (C.active) updateCalibration(now);
+  updateGame(dt); draw(now);
+  requestAnimationFrame(loop);
+}
+
+async function start() {
+  try {
+    $("status").textContent = "Loading model...";
+    const fs = await FilesetResolver.forVisionTasks(WASM);
+    face = await FaceLandmarker.createFromOptions(fs, {
+      baseOptions: { modelAssetPath: FACE_URL }, runningMode: "VIDEO",
+      numFaces: 1, outputFaceBlendshapes: true });
+    cam.srcObject = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+    await cam.play();
+    running = true;
+    $("status").textContent = "Camera on. Now calibrate.";
+  } catch (e) {
+    $("status").textContent = "Error: " + e.message + " (camera needs HTTPS or localhost)";
+  }
+}
+
+$("start").onclick = start;
+$("calib").onclick = startCalibration;
+$("full").onclick = () => canvas.requestFullscreen && canvas.requestFullscreen();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
